@@ -235,10 +235,19 @@ RUN git clone --depth 1 https://github.com/Haoming02/ADetailer-Neo.git \
 # categories). Bake it at BUILD time so a lease does not need a network fetch
 # before the panel can start -- and so a failure to reach HF at boot cannot
 # leave you with a UI but no way to get models.
-RUN curl -fsSL --retry 3 -o /opt/akash/models.json \
+#
+# The mkdir matters: this RUN happens BEFORE the COPY of download_panel.py
+# (which is what creates /opt/akash), so at this point the directory does
+# not exist. curl then fails with "(23) Failure writing output to
+# destination" -- it cannot create the output file -- and because of
+# `set -o pipefail` + `&&` the whole build dies here. The URL itself is
+# fine and public; only the destination directory was missing.
+RUN mkdir -p /opt/akash \
+    && curl -fsSL --retry 3 -o /opt/akash/models.json \
       "https://huggingface.co/datasets/Plaguis/AnimeStaples/resolve/main/models.json" \
     && python3 -c "import json;d=json.load(open('/opt/akash/models.json'));\
-print('models.json:', sum(len(v) for v in d.values() if isinstance(v,list)), 'items')"
+print('models.json:', sum(len(v) for v in d.values() if isinstance(v,list)), 'items')" \
+    && test -s /opt/akash/models.json
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY Caddyfile /etc/caddy/Caddyfile

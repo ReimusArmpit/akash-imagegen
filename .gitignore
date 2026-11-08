@@ -3,6 +3,8 @@ secrets.env
 work/
 logs/
 .env
+gh.env
+*.env
 # deploy-test.sh renders credentials into this before deploying -- it must
 # never be committed, it contains the plaintext password.
 .sdl.rendered.yaml

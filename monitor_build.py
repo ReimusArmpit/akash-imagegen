@@ -7,10 +7,17 @@ Usage:
     python3 monitor_build.py --once     one snapshot and exit
     python3 monitor_build.py --logs     also tail the running step's log
 
-No dependencies (stdlib only) and no API token needed -- the repo is public,
-so anonymous read access is enough for the run/job/step state. If you want
-the log tail and the API refuses it anonymously, set GITHUB_TOKEN to a token
-with `repo` scope.
+No dependencies (stdlib only). The run/job/step state needs no API token --
+the repo is public, so anonymous read access covers it.
+
+GitHub gates the log endpoints behind authentication even for public repos
+(403 without a token), so `--logs` needs a token:
+
+    export GITHUB_TOKEN=ghp_xxx      # or GH_TOKEN
+
+A `gh.env` file containing `GITHUB_TOKEN=ghp_xxx` is picked up automatically
+(looked up next to this script, in the cwd, and in ~/tmp). The value is read
+from disk and never printed.
 
 Nothing is written to disk. This only reads the GitHub API.
 """
@@ -22,6 +29,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 REPO = os.environ.get("REPO", "ReimusArmpit/akash-imagegen")
@@ -37,17 +45,76 @@ if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     C = {k: "" for k in C}
 
 
+def _load_token_file() -> str | None:
+    """Read a token from a gh.env-style file without echoing it.
+
+    Accepts either form:
+        GITHUB_TOKEN=ghp_xxx     (KEY=VALUE)
+        ghp_xxx                   (bare token on its own line)
+
+    Looked up next to the script, in the cwd, and in ~/tmp.
+    The value is read from disk and never printed.
+    """
+    prefixes = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh.env"),
+        os.path.join(os.getcwd(), "gh.env"),
+        os.path.join(os.path.expanduser("~"), "tmp", "gh.env"),
+    ]
+    for path in candidates:
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, _, val = line.partition("=")
+                        if key.strip().upper() in ("GITHUB_TOKEN", "GH_TOKEN"):
+                            val = val.strip().strip("'\"")
+                            if val:
+                                return val
+                        continue
+                    # bare token form
+                    if line.startswith(prefixes):
+                        return line
+        except OSError:
+            continue
+    return None
+
+
 def _headers() -> dict:
     h = {"Accept": "application/vnd.github+json", "User-Agent": "akash-build-monitor"}
-    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or _load_token_file()
     if tok:
         h["Authorization"] = "Bearer " + tok
     return h
 
 
+def _opener():
+    """Opener that drops Authorization when a redirect changes host.
+
+    GitHub's log endpoints answer 302 to a signed blob URL on a different
+    host. urllib copies the Authorization header onto that new request and
+    the blob store rejects it with 401. curl drops the header when the host
+    changes; we do the same, which is why curl succeeds and urllib didn't.
+    """
+    class _StripAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new is not None:
+                old_host = urllib.parse.urlparse(req.full_url).netloc
+                new_host = urllib.parse.urlparse(newurl).netloc
+                if old_host != new_host:
+                    new.remove_header("Authorization")
+            return new
+
+    return urllib.request.build_opener(_StripAuthOnRedirect())
+
+
 def get(path: str, raw: bool = False):
     req = urllib.request.Request(API + path, headers=_headers())
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with _opener().open(req, timeout=30) as r:
         return r.read().decode("utf-8", "replace") if raw else json.load(r)
 
 

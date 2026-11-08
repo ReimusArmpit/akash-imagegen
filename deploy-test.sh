@@ -17,7 +17,9 @@
 #   ./deploy-test.sh bids <dseq>   # list bids
 #   ./deploy-test.sh accept <dseq> <provider>
 #   ./deploy-test.sh status <dseq> # lease + endpoints + URLs
-#   ./deploy-test.sh close <dseq>  # stop billing
+#   ./deploy-test.sh list         # every active deployment (what is billing)
+#   ./deploy-test.sh close <dseq> # stop billing, then VERIFY it stopped
+#   ./deploy-test.sh panic        # close EVERY active deployment
 # ============================================================================
 set -uo pipefail
 
@@ -31,6 +33,7 @@ DEPLOY="${DEPLOY:-2500000uakt}"     # 2.5 AKT escrow, refunded on close
 
 die() { echo "[FATAL] $*" >&2; exit 1; }
 say() { echo "==> $*"; }
+warn() { echo "[WARN] $*" >&2; }
 
 # --- secrets ---------------------------------------------------------------
 [ -f "$SECRETS" ] || die "no $SECRETS (copy secrets.env.example)"
@@ -217,15 +220,112 @@ close() {
     say "closing dseq=$dseq (stops billing, refunds unspent escrow)"
     provider-services tx deployment close --dseq "$dseq" \
         --from "$KEY" --node "$NODE" --chain-id "$CHAIN" \
-        --gas auto --gas-adjustment 1.4 --gas-prices 0.025uakt -y
+        --gas auto --gas-adjustment 1.4 --gas-prices 0.025uakt -y \
+        || die "close TRANSACTION failed for dseq=$dseq -- STILL BILLING, retry"
+
+    # A broadcast tx is not a closed deployment. The tx can be included and
+    # still leave the deployment open (wrong dseq, gas too low so it never
+    # lands, node lagging). This is the money path, so confirm on-chain that
+    # the state actually changed instead of trusting the exit code.
+    say "verifying dseq=$dseq is closed on-chain"
+    local addr state
+    addr=$(provider-services keys show "$KEY" -a)
+    for i in $(seq 1 10); do
+        state=$(provider-services query deployment get \
+                    --owner "$addr" --dseq "$dseq" \
+                    --node "$NODE" --chain-id "$CHAIN" -o json 2>/dev/null \
+                | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("unknown"); raise SystemExit
+print((d.get("deployment") or d).get("state", "unknown"))
+' 2>/dev/null)
+        [ "$state" = "closed" ] && { say "dseq=$dseq confirmed CLOSED -- billing stopped"; return 0; }
+        sleep 2
+    done
+    warn "dseq=$dseq still reports state='$state' after ~20s."
+    warn "Billing may still be running. Re-run: ./deploy-test.sh close $dseq"
+    warn "Check manually:  provider-services query deployment get --owner $addr --dseq $dseq"
+    return 1
+}
+
+# Every deployment of this key that is still open/active. This exists because
+# the single most likely emergency is not knowing the dseq: a create that
+# printed a number you lost, or a second shell, or a lease someone else opened
+# on the same key. `panic` needs to find work without being told where to look.
+list() {
+    local addr
+    addr=$(provider-services keys show "$KEY" -a)
+    say "active deployments for $addr"
+    provider-services query deployment list \
+        --owner "$addr" --node "$NODE" --chain-id "$CHAIN" \
+        -o json 2>/dev/null \
+        | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("  (could not parse query output)"); raise SystemExit(1)
+rows=d.get("deployments") or []
+live=[]
+for r in rows:
+    dep=r.get("deployment",r)
+    state=dep.get("state","?")
+    dseq=(dep.get("deployment_id") or dep.get("id") or {}).get("dseq","?")
+    if state in ("active","open"):
+        live.append(str(dseq))
+    print(f"  dseq={dseq:>10}  state={state}")
+if not live:
+    print("  (nothing is billing)")
+else:
+    print()
+    print("billing now:", " ".join(live))
+' || die "deployment query failed"
+}
+
+# The actual kill switch: stop every active deployment for this key.
+# Sequential on purpose -- deployments are independent, and firing N signed
+# txs at once from one account races the sequence number and they all fail.
+panic_close() {
+    local addr dseqs dseq rc=0
+    addr=$(provider-services keys show "$KEY" -a)
+    dseqs=$(provider-services query deployment list \
+                --owner "$addr" --node "$NODE" --chain-id "$CHAIN" \
+                -o json 2>/dev/null \
+            | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+for r in d.get("deployments") or []:
+    dep=r.get("deployment",r)
+    if dep.get("state") in ("active","open"):
+        print((dep.get("deployment_id") or dep.get("id") or {}).get("dseq",""))
+' 2>/dev/null) || die "could not list deployments; close is NOT confirmed"
+
+    dseqs=$(echo "$dseqs" | grep -v '^$' || true)
+    if [ -z "$dseqs" ]; then
+        say "no active deployments -- nothing is billing"
+        return 0
+    fi
+    say "closing: $(echo $dseqs | tr '\n' ' ')"
+    for dseq in $dseqs; do
+        close "$dseq" || rc=1
+    done
+    return $rc
 }
 
 case "${1:-preflight}" in
-    preflight) preflight ;;
-    create)    create ;;
-    bids)      bids "${2:-}" ;;
-    accept)    accept "${2:-}" "${3:-}" ;;
-    status)    status "${2:-}" "${3:-}" ;;
-    close)     close "${2:-}" ;;
+    preflight)   preflight ;;
+    create)      create ;;
+    bids)        bids "${2:-}" ;;
+    accept)      accept "${2:-}" "${3:-}" ;;
+    status)      status "${2:-}" "${3:-}" ;;
+    list)        list ;;
+    close)       close "${2:-}" ;;
+    panic)       panic_close ;;
     *) die "unknown action: $1" ;;
 esac

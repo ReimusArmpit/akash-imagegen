@@ -196,12 +196,28 @@ Credentials live in `secrets.env` (gitignored, chmod 600), never in the SDL.
 ./deploy-test.sh bids <dseq>
 ./deploy-test.sh accept <dseq> <provider>
 ./deploy-test.sh status <dseq>
-./deploy-test.sh close <dseq>  # stop billing
+./deploy-test.sh list         # what is billing right now
+./deploy-test.sh close <dseq>  # stop billing, then verify it stopped
+./deploy-test.sh panic        # close EVERY active deployment
 ```
 
 `preflight` checks the CLI, the wallet balance (>5 AKT for escrow+fees), that
 the image is tagged, that there is a `global: true` endpoint, and that the SDL
 renders without leftover placeholders.
+
+### Stopping the meter
+
+You do not need to remember the dseq. `./deploy-test.sh panic` lists every
+`active`/`open` deployment for the key and closes each one — that is the
+two-seconds-after-you-realise path. `list` alone is a read-only check.
+
+`close` deliberately does **not** trust the transaction. A `tx deployment
+close` can broadcast successfully and still leave the deployment open (wrong
+dseq, gas too low to be included, node lagging), and the exit code alone will
+not tell you. After closing it polls the chain for up to ~20s until the
+deployment reports `closed`, and if it never does it exits non-zero and tells
+you billing may still be running. A kill switch that reports success without
+checking is worse than none.
 
 ### Which SDL
 

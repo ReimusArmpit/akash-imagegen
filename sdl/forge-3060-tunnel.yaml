@@ -1,0 +1,99 @@
+---
+# RTX 3060 12GB — Forge-Neo + FileBrowser.
+#
+# IMPORTANT: Akash REQUIRES at least one global endpoint. A manifest with no
+# `global: true` expose is rejected with:
+#     "invalid manifest: zero global services"   (manifest/v2beta2/groups.go:30)
+#
+# So "publish nothing" is not an option, and the cloudflared-tunnel idea cannot
+# stand alone. What this SDL does instead:
+#
+#   * publishes ONE port (8080) on a tiny internal Caddy reverse proxy
+#   * Forge-Neo and FileBrowser stay loopback-only, behind that proxy
+#   * the proxy requires Basic auth, and by default returns 404 for everything
+#
+# That gives you the API surface a provider requires while leaving no UI
+# reachable without credentials. If you prefer tunnels only, set MODE=tunnel and
+# still keep this port published -- it costs nothing and the deployment is
+# invalid without it.
+version: "2.0"
+
+services:
+  ui:
+    # PIN THIS. Akash rejects untagged images and :latest as non-reproducible.
+    # Built by .github/workflows/build-image.yml -> pushed to GHCR.
+    image: ghcr.io/ReimusArmpit/akash-imagegen:v1
+    command:
+      - /bin/bash
+      - -lc
+    args:
+      - >-
+        exec /usr/local/bin/entrypoint.sh
+    env:
+      - MODE=tunnel
+      - WORK=/work
+      # Required; refuse-to-boot when absent. Use ONLY letters, digits, '-' and
+      # '_' -- Neo splits api_auth on ':' and ',' and raises ValueError on
+      # either, which becomes a restart loop that bills GPU with no UI.
+      - NEO_USER=admin
+      - NEO_PASS=CHANGEME_at_deploy
+      - FB_USER=admin
+      - FB_PASS=CHANGEME_at_deploy
+      - PROXY_USER=admin
+      - PROXY_PASS=CHANGEME_at_deploy
+      # Get to the UI immediately; pre-pull models later once /work is warm.
+      - SKIP_MODELS=1
+    # The one endpoint Akash demands. Caddy listens here and only here is
+    # anything routable; 8188/7860 never leave the container.
+    expose:
+      - port: 8080
+        as: 80
+        to:
+          - global: true
+        http_options:
+          max_body_size: 1073741824      # 1 GiB, for model/LoRA uploads
+          read_timeout: 300000
+          send_timeout: 300000
+    params:
+      storage:
+        work:
+          mount: /work
+          readOnly: false
+
+profiles:
+  compute:
+    ui:
+      resources:
+        cpu:
+          units: 4.0
+        memory:
+          size: 12Gi
+        storage:
+          # Root fs must hold the WHOLE image plus the panel's quota headroom.
+          # 40Gi was sized for the old 4-mode image. This image is Forge-only
+          # (torch ~6GB + Forge + extensions ~= 14GB), and the panel is
+          # configured with a 28GB quota, so 40Gi leaves almost nothing for
+          # the runtime. 50Gi is the floor that actually works.
+          - size: 50Gi
+          - name: work
+            size: 60Gi
+            attributes:
+              persistent: true
+              class: beta3      # NVMe; omitting class silently gives HDD
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                - model: rtx3060
+  placement:
+    akash:
+      pricing:
+        ui:
+          denom: uact
+          amount: 120           # $0.072/hr ceiling (120 * 600 / 1e6)
+deployment:
+  ui:
+    akash:
+      profile: ui
+      count: 1

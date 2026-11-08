@@ -1,0 +1,41 @@
+# Keep the build context small and, more importantly, keep secrets out of it.
+#
+# Without this file, `docker build` uploads the ENTIRE directory to the
+# builder -- including secrets.env (which holds the real Neo / FileBrowser /
+# proxy passwords) and .git. The Dockerfile never COPYs them, but they still
+# cross the wire and end up in the builder's cache.
+#
+# The image is built by GitHub Actions, so the context is uploaded to
+# GitHub's builders on every run. This file is the thing that stops your
+# passwords from going there.
+
+# secrets and local state
+secrets.env
+*.rendered.yaml
+rendered*.yaml
+.sdl.rendered.yaml
+.env
+*.db
+
+# vcs
+.git
+.gitignore
+.github
+
+# docs / tooling that the image does not need
+README.md
+*.md
+build.sh
+verify.sh
+deploy-test.sh
+watch-gpus.sh
+
+# runtime dirs
+work/
+logs/
+
+# editor cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store

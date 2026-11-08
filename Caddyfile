@@ -1,0 +1,129 @@
+# Caddyfile — the single published endpoint Akash requires.
+#
+# Forge-Neo (127.0.0.1:8188) and FileBrowser (127.0.0.1:7860) are loopback-only.
+# This is the only listener on the container's published port.
+#
+# Basic auth here is belt-and-braces: Neo already enforces --gradio-auth and
+# --api-auth, and FileBrowser has its own login. The proxy layer exists so that
+# the published port is not an unauthenticated surface at all.
+#
+# {$PROXY_USER}/{$PROXY_PASS} come from the SDL env block. If they are unset
+# Caddy fails to start rather than serving without auth.
+{
+	# No admin API, no config-writing surface.
+	admin off
+	# Don't advertise the version.
+	servers {
+		protocols h1 h2
+	}
+}
+
+:8080 {
+	# --- auth -------------------------------------------------------------
+	# bcrypt hash, generated at container start by the entrypoint from
+	# PROXY_PASS. If the placeholder is still here, Caddy will reject every
+	# request rather than allow anonymous access.
+	basic_auth {
+		{$PROXY_USER} {$PROXY_PASS_HASH}
+	}
+
+	# --- Forge-Neo --------------------------------------------------------
+	# Long timeouts: image generation and model loading are slow, and Caddy's
+	# defaults will cut a queue mid-run.
+	handle /sdapi/* {
+		reverse_proxy 127.0.0.1:8188 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+	handle /queue/* {
+		reverse_proxy 127.0.0.1:8188 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8188 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+	handle /run/* {
+		reverse_proxy 127.0.0.1:8188 {
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# --- Model download panel ----------------------------------------------
+	# The original download_extras.py is a menu (input() calls) and dies with
+	# EOFError inside a container, so the panel serves the same catalogue over
+	# HTTP instead. One model or LoRA at a time -- the full set is ~190 GB.
+	#
+	# /dl itself (no trailing path) must also route, because that is where the
+	# panel's HTML page lives. strip_prefix rewrites /dl -> "" which the
+	# panel's root route does not match, so the bare /dl gets its own handle.
+	handle /dl {
+		rewrite * /
+		reverse_proxy 127.0.0.1:7861 {
+			header_up X-Forwarded-Prefix /dl
+		}
+	}
+	handle /dl/* {
+		uri strip_prefix /dl
+		reverse_proxy 127.0.0.1:7861 {
+			header_up X-Forwarded-Prefix /dl
+			flush_interval -1
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	# --- FileBrowser ------------------------------------------------------
+	# Same shape as the panel: /files and /files/... both need to work.
+	handle /files {
+		rewrite * /
+		reverse_proxy 127.0.0.1:7860
+	}
+	handle /files/* {
+		uri strip_prefix /files
+		reverse_proxy 127.0.0.1:7860
+	}
+
+	# --- everything else -> Neo UI ---------------------------------------
+	handle {
+		reverse_proxy 127.0.0.1:8188 {
+			# Gradio uses websockets for progress updates; this must not buffer.
+			flush_interval -1
+			transport http {
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}
+
+	# Uploads (LoRA/checkpoints) exceed Caddy's 10 MB default request body.
+	request_body {
+		max_size 1GB
+	}
+
+	encode gzip
+	log {
+		output stdout
+		format console
+	}
+}

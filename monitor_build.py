@@ -6,6 +6,13 @@ Usage:
     python3 monitor_build.py            follow the newest run until it finishes
     python3 monitor_build.py --once     one snapshot and exit
     python3 monitor_build.py --logs     also tail the running step's log
+    python3 monitor_build.py --errors   grep the log for error lines
+
+GitHub serves job logs ONLY after the job completes -- while a job is
+running every log endpoint returns 404, even with a valid token. There is
+no streaming API for this. So --logs/--errors light up once the run
+finishes; during the build you get live step status, and the live output
+is in the web UI at the run URL.
 
 No dependencies (stdlib only). The run/job/step state needs no API token --
 the repo is public, so anonymous read access covers it.
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -142,15 +150,47 @@ def jobs_of(run_id: int) -> list:
 
 
 def tail_job_log(job_id: int, n: int = 18) -> tuple[list[str], str | None]:
-    """Return the last n non-empty lines of a job log, or an error string."""
+    """Return the last n non-empty lines of a job log, or an error string.
+
+    NOTE: GitHub only serves job logs once the job has COMPLETED. While the
+    job is still running every log endpoint returns 404 with an empty body,
+    even with a valid token. There is no streaming variant of the API --
+    the live log in the web UI comes from a separate service. So during the
+    build we can show step status but not the log; the log becomes
+    available a moment after the run finishes.
+    """
     try:
         text = get(f"/repos/{REPO}/actions/jobs/{job_id}/logs", raw=True)
     except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return [], "not available until the job finishes"
         return [], f"HTTP {e.code}"
     except Exception as e:  # noqa: BLE001
         return [], str(e)
     lines = [ln for ln in text.splitlines() if ln.strip()]
     return lines[-n:], None
+
+
+ERROR_PAT = re.compile(
+    r"(##\[error\]|\berror:|ERROR:|Traceback|failed to solve|"
+    r"did not complete successfully|No matching distribution|"
+    r"curl: \(\d+\)|pip.*conflict|Command failed|exit code: [1-9])",
+    re.IGNORECASE,
+)
+
+
+def grep_job_log(job_id: int, limit: int = 25) -> tuple[list[str], str | None]:
+    """Return log lines that look like errors -- the useful shortlist."""
+    try:
+        text = get(f"/repos/{REPO}/actions/jobs/{job_id}/logs", raw=True)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return [], "not available until the job finishes"
+        return [], f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return [], str(e)
+    hits = [ln for ln in text.splitlines() if ln.strip() and ERROR_PAT.search(ln)]
+    return hits[-limit:], None
 
 
 def package_tags() -> list[str]:
@@ -168,7 +208,7 @@ def package_tags() -> list[str]:
     return out
 
 
-def render(run: dict, show_logs: bool, log_cache: dict) -> None:
+def render(run: dict, show_logs: bool, log_cache: dict, show_errors: bool = False) -> None:
     print(f"\033[H\033[2J", end="")  # home + clear
     title = run.get("name", "?")
     print(f"{C['bold']}{REPO}{C['reset']}  {title}")
@@ -206,12 +246,34 @@ def render(run: dict, show_logs: bool, log_cache: dict) -> None:
                     lines, err = tail_job_log(j["id"])
                     log_cache[key] = (lines, err)
                 lines, err = log_cache[key]
-                if err:
+                if err == "not available until the job finishes":
+                    # GitHub serves job logs only after the job completes.
+                    step = running[0]["name"] if running else "the running step"
+                    print(f"    {C['dim']}log not served while the job runs "
+                          f"(GitHub limitation) -- live output for {step!r} is in "
+                          f"the web UI:{C['reset']}")
+                    print(f"    {C['dim']}{run.get('html_url')}{C['reset']}")
+                elif err:
                     print(f"    {C['dim']}log unavailable ({err}){C['reset']}")
                 elif lines:
                     print(f"    {C['grey']}{'─' * 60}{C['reset']}")
                     for ln in lines:
                         print(f"    {C['grey']}{ln[:160]}{C['reset']}")
+
+        if show_errors:
+            key = ("errors", j["id"])
+            if key not in log_cache:
+                hits, err = grep_job_log(j["id"])
+                log_cache[key] = (hits, err)
+            hits, err = log_cache[key]
+            if err == "not available until the job finishes":
+                print(f"    {C['dim']}error grep unavailable until the job finishes{C['reset']}")
+            elif err:
+                print(f"    {C['dim']}error grep failed ({err}){C['reset']}")
+            elif hits:
+                print(f"    {C['red']}{'─' * 60}{C['reset']}")
+                for ln in hits:
+                    print(f"    {C['red']}{ln[:200]}{C['reset']}")
 
     tags = package_tags()
     if tags:
@@ -227,6 +289,11 @@ def main() -> int:
     once = "--once" in args
     show_logs = "--logs" in args
 
+    show_logs = "--logs" in args
+    show_errors = "--errors" in args
+    if show_errors:
+        show_logs = True  # the error grep needs the same log fetch
+
     log_cache: dict = {}
     last_sig = None
     while True:
@@ -237,13 +304,18 @@ def main() -> int:
             else:
                 sig = (run["id"], run.get("status"), run.get("conclusion"))
                 if sig != last_sig or once:
-                    render(run, show_logs, log_cache)
+                    render(run, show_logs, log_cache, show_errors)
                     last_sig = sig
                 else:
                     # refresh just the log tail while a step is in flight
                     if show_logs:
-                        render(run, show_logs, log_cache)
+                        render(run, show_logs, log_cache, show_errors)
                 if run.get("status") == "completed":
+                    # The log only becomes servable once the job is done, so
+                    # fetch it now rather than showing a stale 404.
+                    if show_logs:
+                        log_cache.clear()
+                        render(run, show_logs, log_cache, show_errors)
                     ok = run.get("conclusion") == "success"
                     print(f"{C['bold']}{'BUILD SUCCEEDED' if ok else 'BUILD FAILED'}{C['reset']}")
                     print(f"  {run.get('html_url')}")

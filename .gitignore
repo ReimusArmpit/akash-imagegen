@@ -10,3 +10,5 @@ gh.env
 .sdl.rendered.yaml
 rendered*.yaml
 *.rendered.yaml
+__pycache__/
+*.pyc

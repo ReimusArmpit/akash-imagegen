@@ -17,6 +17,7 @@
 #   ./deploy-test.sh bids <dseq>   # list bids
 #   ./deploy-test.sh accept <dseq> <provider>
 #   ./deploy-test.sh status <dseq> # lease + endpoints + URLs
+#   ./deploy-test.sh render       # just render the SDL, print where it is
 #   ./deploy-test.sh list         # every active deployment (what is billing)
 #   ./deploy-test.sh close <dseq> # stop billing, then VERIFY it stopped
 #   ./deploy-test.sh panic        # close EVERY active deployment
@@ -320,6 +321,7 @@ for r in d.get("deployments") or []:
 
 case "${1:-preflight}" in
     preflight)   preflight ;;
+    render)      render_sdl ;;
     create)      create ;;
     bids)        bids "${2:-}" ;;
     accept)      accept "${2:-}" "${3:-}" ;;

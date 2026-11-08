@@ -75,13 +75,41 @@ profiles:
           attributes:
             vendor:
               nvidia:
+                # Wide enough to be *biddable*: Console's trial accounts can only
+                # lease from providers carrying console/trials, and those rarely
+                # advertise the exact RTX 3060 this kit was sized for. A single
+                # model pin is the most common reason a trial deploy never gets
+                # a bid (Console reports it after submit, as the trial-provider
+                # attribute failure).
+                #
+                # Forge-Neo needs >=8 GB VRAM for a realistic SDXL workflow, and
+                # the entrypoint warns under 8 GB, so anything below 8 GB here is
+                # rejected anyway. Narrow this back to `- model: rtx3060` if you
+                # move to a paid wallet and want that specific card.
                 - model: rtx3060
+                - model: rtx3060ti
+                - model: rtx3070
+                - model: rtx3080
+                - model: rtx3090
   placement:
     akash:
+      # Trial accounts can only lease from providers carrying
+      # console/trials (or console/trials-registered). Without this attribute
+      # Console rejects the deployment after submit with a trial-provider
+      # error, even when the quote looked fine.
+      attributes:
+        console/trials: "true"
+      signedBy:
+        allOf:
+          - akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63
       pricing:
         ui:
           denom: uact
-          amount: 120           # $0.072/hr ceiling (120 * 600 / 1e6)
+          amount: 500           # $0.30/hr ceiling (500 * 600 / 1e6)
+          # Was 120 ($0.072/hr), which almost no provider bids on, and a trial
+          # holds $1 total -- so the original ceiling was simultaneously too
+          # low to attract bids and needlessly tight for a 24h cap. 500 buys
+          # ~3.3 GPU-hours of headroom inside the $1 trial credit.
 deployment:
   ui:
     akash:

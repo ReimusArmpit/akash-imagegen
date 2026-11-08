@@ -20,6 +20,11 @@
 #   Every push tags with the commit SHA (immutable, so the SDL can pin an
 #   exact image) plus a moving `latest`. `v1` is also updated, because the
 #   SDLs reference it.
+#
+#   The `v1` tag is what makes the SDLs work. Keep it in this list -- if you
+#   drop it, `ghcr.io/ReimusArmpit/akash-imagegen:v1` stops resolving and
+#   every Akash lease fails at startup with a pull error, even though the
+#   build is perfectly green.
 
 name: build-image
 
@@ -87,6 +92,7 @@ jobs:
             type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=v1,enable={{is_default_branch}}
 
       - name: build and push
         uses: docker/build-push-action@v6
@@ -104,6 +110,32 @@ jobs:
           build-args: |
             CUDA_VERSION=12.8.1
             FORGE_REF=neo
+
+      - name: verify the published tags resolve
+        # The build being green does NOT mean the SDL can pull the image.
+        # The SDLs reference a specific tag; if the metadata config stops
+        # producing it, the build still succeeds and every lease fails at
+        # startup with a pull error. Verify the exact tag the SDLs use.
+        #
+        # Anonymous pull is deliberate: Akash providers pull without
+        # credentials, so the manifest must be readable with no token.
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          for TAG in v1 latest; do
+            # Get an anonymous pull token, exactly like a provider would.
+            TOKEN=$(curl -fsSL "https://${REGISTRY}/token?scope=repository:${IMAGE_NAME}:pull&service=${REGISTRY}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+            CODE=$(curl -s -o /tmp/manifest.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+              "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${TAG}")
+            if [ "$CODE" != "200" ]; then
+              echo "::error::${IMAGE}:${TAG} is not pullable (HTTP ${CODE}). The SDLs reference this tag; leases will fail to start."
+              exit 1
+            fi
+            echo "  ${IMAGE}:${TAG} -> HTTP 200 (anonymous pull OK)"
+          done
 
       - name: summary
         run: |

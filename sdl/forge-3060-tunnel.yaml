@@ -81,22 +81,24 @@ profiles:
           attributes:
             vendor:
               nvidia:
-                # Wide enough to be *biddable*: Console's trial accounts can only
-                # lease from providers carrying console/trials, and those rarely
-                # advertise the exact RTX 3060 this kit was sized for. A single
-                # model pin is the most common reason a trial deploy never gets
-                # a bid (Console reports it after submit, as the trial-provider
-                # attribute failure).
+                # TRIAL REALITY: exactly one provider accepts trial deploys
+                # (provider.hurricane.akash.pub, California) and its only GPU
+                # model is a T4 16Gi. Every other card here would submit and
+                # then get no bid, which is what "No node has these GPUs free
+                # right now" actually meant -- not that the network was busy.
                 #
-                # Forge-Neo needs >=8 GB VRAM for a realistic SDXL workflow, and
-                # the entrypoint warns under 8 GB, so anything below 8 GB here is
-                # rejected anyway. Narrow this back to `- model: rtx3060` if you
-                # move to a paid wallet and want that specific card.
-                - model: rtx3060
-                - model: rtx3060ti
-                - model: rtx3070
-                - model: rtx3080
-                - model: rtx3090
+                # No RTX 3060/70/80/90 exists on Akash at all right now (zero
+                # capacity, not zero free), so the old 3060-range pin could
+                # never have matched.
+                #
+                # T4 16Gi clears the 9.8 GB peak this workflow needs. It is
+                # Turing (no BF16, weak FP16), so expect roughly 3-5x slower
+                # than a 3060 for SDXL. Correctness is fine; patience is not.
+                #
+                # On a paid wallet, swap this for rtx5000 (16Gi, ~$0.18/hr) or
+                # a10g (24Gi, ~$0.18/hr) -- both have real capacity and are
+                # only marginally dearer than the T4 while being much faster.
+                - model: t4
   placement:
     akash:
       # Trial accounts can only lease from providers carrying

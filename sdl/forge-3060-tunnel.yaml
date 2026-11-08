@@ -51,9 +51,15 @@ services:
         to:
           - global: true
         http_options:
-          max_body_size: 1073741824      # 1 GiB, for model/LoRA uploads
-          read_timeout: 300000
-          send_timeout: 300000
+          # Akash enforces hard ceilings here and REJECTS the SDL at import:
+          #   max_body_size <= 104857600 (100 MiB) -- ours was 1 GiB, 10x over
+          #   read_timeout  <= 60000 ms (60s)      -- ours was 300000
+          #   send_timeout  <= 60000 ms (60s)
+          # 100 MiB is the largest value that both passes validation and is
+          # useful for LoRA drag-and-drop in Forge.
+          max_body_size: 104857600       # 100 MiB = the enforced maximum
+          read_timeout: 60000
+          send_timeout: 60000
 
 profiles:
   compute:

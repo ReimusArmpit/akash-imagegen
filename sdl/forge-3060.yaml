@@ -42,12 +42,18 @@ services:
         to:
           - global: true
         http_options:
-          # Forge uploads (LoRA/checkpoint drag-and-drop) blow past 1MB default.
-          max_body_size: 1073741824      # 1 GiB
-          # Image previews stream over a long-lived connection; the default
-          # timeouts will cut a queue mid-run.
-          read_timeout: 300000
-          send_timeout: 300000
+          # Akash enforces hard ceilings here and REJECTS the SDL at import:
+          #   max_body_size <= 104857600 (100 MiB)  -- both of ours were 1 GiB,
+          #                                          10x over
+          #   read_timeout  <= 60000 ms (60s)       -- ours were 300000
+          #   send_timeout  <= 60000 ms (60s)
+          # Forge uploads (LoRA/checkpoint drag-and-drop) exceed the 1MB default,
+          # so 100 MiB is the largest value that both passes validation and is
+          # useful. Large files belong in the download panel or FileBrowser
+          # anyway; both are Caddy-proxied and not subject to http_options.
+          max_body_size: 104857600       # 100 MiB = the enforced maximum
+          read_timeout: 60000
+          send_timeout: 60000
     env:
       # direct = bind the services to 0.0.0.0 and rely on the published port.
       # tunnel = keep everything on loopback and use cloudflared instead.

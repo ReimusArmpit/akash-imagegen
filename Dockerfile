@@ -36,8 +36,13 @@
 #   the bottom of this file for why.
 #
 # SIZE: the root fs on the SDL is 50GiB and must hold the whole image plus
-#   your models. Torch alone is ~6 GB of that. ComfyUI + llama.cpp (which
-#   compiles CUDA kernels at build time) roughly doubles the image.
+#   your models. Measured: the pushed image is 7.35 GB compressed, ~16 GB
+#   unpacked, and the boot-time `cp -a /opt/forge -> /work/forge-neo` adds a
+#   second copy of Neo (code + extensions, no models). So the fixed cost is
+#   ~18 GB before a single checkpoint, leaving ~32 GB of a 50Gi disk.
+#   ComfyUI and llama.cpp are NOT in this image (removed outright, see the
+#   block further down), so the old "roughly doubles the image" no longer
+#   applies.
 # ============================================================================
 # ---------------------------------------------------------------------------
 # Base image.
@@ -252,6 +257,8 @@ print('models.json:', sum(len(v) for v in d.values() if isinstance(v,list)), 'it
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY download_panel.py /opt/akash/download_panel.py
+# diag.py is imported by download_panel.py; both must sit in the same dir.
+COPY diag.py /opt/akash/diag.py
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # MODE: tunnel (default, cloudflared only) | direct (bind 0.0.0.0, SDL ports)
@@ -261,7 +268,7 @@ ENV MODE=tunnel \
     NEO_PORT=8188 \
     FB_PORT=7860 \
     PANEL_PORT=7861 \
-    PANEL_QUOTA_GB=28
+    PANEL_QUOTA_GB=20
 
 EXPOSE 8080
 # tini reaps zombie children; without it the container eventually wedges.

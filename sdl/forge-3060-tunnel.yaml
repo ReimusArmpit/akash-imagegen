@@ -31,6 +31,8 @@ services:
         exec /usr/local/bin/entrypoint.sh
     env:
       - MODE=tunnel
+      # /work is now a plain directory on the root fs. There is NO persistent
+      # volume -- see the storage block below.
       - WORK=/work
       # Required; refuse-to-boot when absent. Use ONLY letters, digits, '-' and
       # '_' -- Neo splits api_auth on ':' and ',' and raises ValueError on
@@ -41,8 +43,6 @@ services:
       - FB_PASS=CHANGEME_at_deploy
       - PROXY_USER=admin
       - PROXY_PASS=CHANGEME_at_deploy
-      # Get to the UI immediately; pre-pull models later once /work is warm.
-      - SKIP_MODELS=1
     # The one endpoint Akash demands. Caddy listens here and only here is
     # anything routable; 8188/7860 never leave the container.
     expose:
@@ -54,11 +54,6 @@ services:
           max_body_size: 1073741824      # 1 GiB, for model/LoRA uploads
           read_timeout: 300000
           send_timeout: 300000
-    params:
-      storage:
-        work:
-          mount: /work
-          readOnly: false
 
 profiles:
   compute:
@@ -69,17 +64,12 @@ profiles:
         memory:
           size: 12Gi
         storage:
-          # Root fs must hold the WHOLE image plus the panel's quota headroom.
-          # 40Gi was sized for the old 4-mode image. This image is Forge-only
-          # (torch ~6GB + Forge + extensions ~= 14GB), and the panel is
-          # configured with a 28GB quota, so 40Gi leaves almost nothing for
-          # the runtime. 50Gi is the floor that actually works.
+          # Measured budget: image is 7.35 GB compressed / ~16 GB unpacked,
+          # and the boot-time `cp -a /opt/forge -> /work/forge-neo` adds a
+          # second copy of Neo (~2 GB). Fixed cost is ~18 GB before any model.
+          # The panel's quota is 20 GB, so 50Gi leaves ~32 GB usable and keeps
+          # 20 GB of models comfortably inside the disk.
           - size: 50Gi
-          - name: work
-            size: 60Gi
-            attributes:
-              persistent: true
-              class: beta3      # NVMe; omitting class silently gives HDD
         gpu:
           units: 1
           attributes:

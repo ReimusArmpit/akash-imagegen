@@ -52,6 +52,8 @@ services:
       # direct = bind the services to 0.0.0.0 and rely on the published port.
       # tunnel = keep everything on loopback and use cloudflared instead.
       - MODE=direct
+      # /work is now a plain directory on the root fs. There is NO persistent
+      # volume -- see the storage block below.
       - WORK=/work
       # Required; refuse-to-boot when absent. Use ONLY letters, digits, '-' and
       # '_' -- Neo splits api_auth on ':' and ',' and raises ValueError on
@@ -62,11 +64,6 @@ services:
       - FB_PASS=CHANGEME_at_deploy
       - PROXY_USER=admin
       - PROXY_PASS=CHANGEME_at_deploy
-    params:
-      storage:
-        work:
-          mount: /work
-          readOnly: false
 
 profiles:
   compute:
@@ -77,17 +74,11 @@ profiles:
         memory:
           size: 12Gi
         storage:
-          # Root fs must hold the WHOLE image plus the panel's quota headroom.
-          # The image is Forge-only (torch ~6GB + Forge + extensions ~= 14GB),
-          # so 50Gi leaves room for the runtime and the image to coexist.
+          # Measured budget: image is 7.35 GB compressed / ~16 GB unpacked,
+          # and the boot-time `cp -a /opt/forge -> /work/forge-neo` adds a
+          # second copy of Neo (~2 GB). Fixed cost is ~18 GB before any model.
+          # The panel's quota is 20 GB, so 50Gi leaves ~32 GB usable.
           - size: 50Gi
-          - name: work
-            size: 60Gi
-            attributes:
-              persistent: true
-              # beta3 = NVMe. OMIT THIS and you silently get beta1 = HDD,
-              # which makes checkpoint loads crawl. This is a real trap.
-              class: beta3
         gpu:
           units: 1
           attributes:

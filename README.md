@@ -30,17 +30,18 @@ secrets.env                 trial credentials (gitignored, chmod 600)
 
 `Dockerfile` bakes the software (Neo, torch, extensions, Caddy, FileBrowser,
 cloudflared) into one image. `entrypoint.sh` is PID 1 and boots it: it seeds
-Forge into the persistent `/work` volume, starts the download panel and
+Forge into `/work` on the root fs, starts the download panel and
 FileBrowser on loopback, puts Caddy on the published port with basic auth, and
 optionally opens cloudflared tunnels. Nothing is installed at boot — a lease
 must not spend GPU minutes running pip.
 
-**Three surfaces, one port:**
+**Four surfaces, one port:**
 
 | path | what |
 |---|---|
 | `/` | Forge-Neo UI (`--gradio-auth` + `--api-auth`) |
 | `/dl` | model download panel — pick individual models/LoRAs |
+| `/dl/diag` | system diagnostics — GPU, disk, memory, processes, log tails |
 | `/files` | FileBrowser — browse `/work`, including your models |
 
 ---
@@ -250,21 +251,52 @@ cleanup.
 min; on an A100 it's $0.40. Download into `/work` while the lease is already
 open — you can't pre-warm it before you have a GPU.
 
-**Persistent storage does not survive a lease close.** Akash's docs are explicit:
-data is lost when you close the deployment, and on provider migration. `beta3`
-persistent storage survives *container restarts* and *deployment updates* on the
-same provider — that's all. Budget the re-download.
+**Persistent storage is not used at all.** Akash's docs are explicit that data
+is lost when you close a deployment and on provider migration; `beta3`
+persistent storage only survives *container restarts* and *deployment updates*
+on the same provider. That partial guarantee costs ~2x per GB and narrows the
+provider pool, so this kit skips it entirely and uses the root fs. Budget the
+re-download.
 
-**Storage class matters.** `beta3` = NVMe, `beta2` = SSD, `beta1` = HDD (the
-default if omitted). Omit the class and you get HDD, then wonder why checkpoint
-loads crawl. This is a silent failure — nothing errors, it's just slow.
+**Storage is ephemeral — there is no persistent volume.** Everything (image,
+Forge copy, models, logs) lives on the single 50Gi root fs. That is deliberate:
+persistent storage costs roughly twice as much per GB and restricts bids to
+providers advertising `feat-persistent-storage`. The cost is that models do not
+survive a redeploy — re-download your checkpoint and LoRAs after each one.
 
-**Root filesystem must be ≥ the image size.** `50Gi` in the SDLs covers the
-~14 GiB Forge-only image plus the runtime. Too small and the lease fails to
-start *after* you've already paid for the bid.
+**The panel quota is a guard, not a limit you should reach.** `PANEL_QUOTA_GB`
+defaults to 20, against ~21GB of fixed cost (unpacked image, Forge copy,
+runtime, logs) on a 50Gi disk. Raise it only if you also raise the root fs,
+or the panel will fill the disk and Neo will die with an unrelated-looking
+write error.
 
-**Models live on `/work` (60Gi), not the root fs.** The panel's quota applies to
-the `/work` volume. The root fs holds the image and the runtime.
+**Observability lives at `/dl/diag`.** Container stdout is unreachable from a
+browser (it is only available through `provider-services lease-logs`), so the
+entrypoint mirrors all of its output to `/work/logs/entrypoint.log`, and the
+diag page shows that plus every service log, disk/memory/load, the process list
+and the GPU that was actually allocated. The GPU section matters: `nvidia-smi`
+is not in this image (the base is `nvidia/cuda:*-runtime`), so VRAM facts come
+from torch. A provider handing over a 6GB card instead of the 12GB one you
+bid on shows up there instead of as a mystery CUDA OOM.
+
+**Storage class is irrelevant now.** With no persistent volume there is no
+`class` to get wrong — the old `beta3`-vs-`beta1` (NVMe vs HDD) trap only
+applied to named persistent volumes. Root-fs performance is the provider's
+business.
+
+**Root filesystem must be ≥ the image size.** Measured: the `v1` image is
+**7.35 GB compressed / ~16 GB unpacked**, and the boot-time `cp -a
+/opt/forge -> /work/forge-neo` duplicates Neo ($ work and $ opt are separate
+mounts, so it is a genuine copy, not a hardlink) for roughly **18 GB of fixed
+cost before any model**. `50Gi` in the SDLs therefore leaves about **32 GB for
+models and logs**. Too small and the lease fails to start *after* you've already
+paid for the bid.
+
+**Models are on the root fs.** `/work/models` is the panel's destination, on
+the same 50Gi filesystem as the image. The panel's `PANEL_QUOTA_GB=20` guard is
+sized so that 20 GB of models plus the ~18 GB fixed cost stays inside 50Gi with
+headroom to spare — your one checkpoint plus two LoRAs (~8 GB) is well clear of
+it. See the quota note above.
 
 **The provider pulls your image anonymously.** Make the registry repo public, or
 the lease starts and immediately fails. `build.sh` checks `docker manifest

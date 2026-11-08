@@ -25,7 +25,8 @@
 #   FB_USER  / FB_PASS        FileBrowser login
 #   HF_TOKEN                  optional, avoids HF rate limits
 #   CIVITAI_TOKEN             optional, for the downloader
-#   SKIP_MODELS=1             start the UI without waiting on model downloads
+#   SKIP_MODELS=1             (obsolete: nothing downloads at boot any more)
+#   PANEL_QUOTA_GB=20         cap on model bytes the panel will fetch
 # ============================================================================
 set -uo pipefail
 
@@ -38,10 +39,35 @@ MODELS_DIR="$WORK/models"
 LOG_DIR="$WORK/logs"
 
 hr()  { echo; echo "=== $* ==="; }
-die() { echo "[FATAL] $*" >&2; exit 1; }
+# TAIL_PID is set further down, after the log sink is installed. die() may be
+# called before or after that, so it must tolerate an unset/invalid pid.
+die() { echo "[FATAL] $*" >&2; [ -n "${TAIL_PID:-}" ] && kill "$TAIL_PID" 2>/dev/null; exit 1; }
 warn(){ echo "[WARN] $*" >&2; }
 
 mkdir -p "$WORK" "$MODELS_DIR" "$LOG_DIR"
+
+# ---------------------------------------------------------------------------
+# Mirror all output into $LOG_DIR/entrypoint.log.
+# ---------------------------------------------------------------------------
+# On Akash, container stdout is only reachable through `provider-services
+# lease-logs` or the provider's dashboard -- neither of which is available from
+# the browser. That makes the most useful output in the container (boot
+# sequence, GPU check, why Neo died, tunnel URLs) invisible exactly when it
+# matters. Writing it to a file puts it behind the same diag page and
+# FileBrowser as every other log.
+#
+# The FILE is authoritative and stdout is mirrored from it, not the other way
+# round. `exec > >(tee -a file)` looks equivalent but silently loses the tail
+# of the output when the shell exits: measured at 9/12 runs writing zero lines,
+# because bash does not wait for the tee process substitution. Since `die()`
+# paths exit immediately, that would lose exactly the fatal boot errors this is
+# meant to capture. Appending to the file and tail -F'ing it back out is
+# deterministic (0/12 failures) and keeps provider-side logging working.
+exec 3>&1 4>&2
+: > "$LOG_DIR/entrypoint.log"
+exec >> "$LOG_DIR/entrypoint.log" 2>&1
+tail -F -n +1 "$LOG_DIR/entrypoint.log" >&3 2>&4 &
+TAIL_PID=$!
 
 # ---------------------------------------------------------------------------
 # 0. Credentials
@@ -140,9 +166,36 @@ if command -v nvidia-smi >/dev/null 2>&1; then
         || warn "nvidia-smi present but query failed"
 else
     # Not fatal: the driver is host-side and only the CUDA libs are injected.
-    # Torch can still work with no nvidia-smi in the container. Warn loudly but
-    # carry on, because streaming multiprocessors being present is what matters.
+    # Torch can still work with no nvidia-smi in the container. Assert what we
+    # actually got, though: a provider advertising a 12GB 3060 that hands over
+    # a 6GB card produces CUDA OOM on every generation, and without this line
+    # that looks like a bug in the prompt rather than the lease.
     warn "nvidia-smi not in this image. Verifying via torch instead."
+    python3 - <<'PYEOF' || warn "torch GPU check failed (GPU may be absent)"
+import sys
+try:
+    import torch
+except Exception as exc:
+    print(f"[WARN] torch not importable: {exc}", file=sys.stderr)
+    sys.exit(0)
+if not torch.cuda.is_available():
+    print("[WARN] torch.cuda.is_available() is False -- no GPU visible to the "
+          "container. Neo will start but generation will fail.", file=sys.stderr)
+    sys.exit(0)
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    free, total = torch.cuda.mem_get_info(i)
+    print(f"[OK] GPU {i}: {p.name}, {p.total_memory / 1024**3:.1f} GB VRAM "
+          f"({free / 1024**3:.1f} GB free), compute {p.major}.{p.minor}, "
+          f"{p.multi_processor_count} SMs")
+    # The 3060 has 12GB. Anything at or below 8GB cannot hold an SDXL
+    # checkpoint plus its VAE/text encoders at full precision.
+    if p.total_memory < 8 * 1024**3:
+        print(f"[WARN] GPU {i} has under 8 GB VRAM. SDXL checkpoints will "
+              f"likely OOM; prefer --medvram or a smaller model.",
+              file=sys.stderr)
+print(f"[OK] torch {torch.__version__} cuda {torch.version.cuda}")
+PYEOF
 fi
 
 # ---------------------------------------------------------------------------
@@ -160,8 +213,11 @@ NEO_SRC="${NEO_SRC:-/opt/forge}"
 [ -f "$NEO_SRC/launch.py" ] || die "no launch.py in $NEO_SRC (bad image?)"
 
 if [ -f "$NEO_DIR/launch.py" ]; then
-    echo "[SKIP] $NEO_DIR already present (persistent volume)"
+    echo "[SKIP] $NEO_DIR already present (same filesystem from an earlier boot)"
 else
+    # This is a real copy, not a hardlink: /work and /opt are separate mounts
+    # in the container, so `cp -a` duplicates Neo. That costs ~1-2 GB on the
+    # root fs and is accounted for in the storage budget in the Dockerfile.
     echo "[..] seeding $NEO_DIR from $NEO_SRC"
     mkdir -p "$NEO_DIR"
     cp -a "$NEO_SRC/." "$NEO_DIR/" || die "seed failed"
@@ -338,6 +394,13 @@ if [ ! -s "$PANEL_PY" ]; then
     cp "${PANEL_SRC:-/opt/akash/download_panel.py}" "$PANEL_PY" 2>/dev/null \
       || warn "could not obtain download_panel.py from $PANEL_SRC -- panel disabled"
 fi
+# diag.py is imported by the panel, so it must sit BESIDE it. Copying only the
+# panel script and leaving diag.py behind in /opt/akash makes `import diag`
+# fail at startup, which takes down the entire download panel -- not just the
+# diagnostics page. Copy it unconditionally: it is ~10KB and always cheap to
+# refresh, unlike the panel script.
+cp "${DIAG_SRC:-/opt/akash/diag.py}" "$PANEL_DIR/diag.py" 2>/dev/null \
+  || warn "could not obtain diag.py; the panel will fail to import diag";
 # models.json is the catalogue the panel reads. It is baked into the image at
 # /opt/akash/models.json, so a lease needs no network fetch to show the
 # catalogue. The curl is only a fallback for a hand-rolled image.
@@ -392,6 +455,9 @@ PIDS=()
 cleanup() {
     echo; echo "[..] shutting down"
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    # The log mirror is not in PIDS: it must die last, or the shutdown messages
+    # above never reach the container's real stdout.
+    [ -n "${TAIL_PID:-}" ] && kill "$TAIL_PID" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup TERM INT
@@ -456,16 +522,28 @@ done
 PANEL_PORT="${PANEL_PORT:-7861}"
 if [ -s "$PANEL_PY" ] && [ -s "$NEO_DIR/models.json" ]; then
     echo "[..] starting download panel on 127.0.0.1:$PANEL_PORT"
-    # The quota stops a download from filling the volume and taking down the
-    # running UI. It applies to $MODELS_DIR, which lives on the persistent
-    # /work volume (60Gi) -- NOT the 50GiB root fs, which holds the image.
-    # 28GB leaves room for a few checkpoints plus room to grow.
+    # The quota stops a download from filling the filesystem and taking down the
+    # running UI. It applies to $MODELS_DIR, which now lives on the 50Gi root fs
+    # alongside the ~17GB unpacked image -- there is no separate /work volume.
+    #
+    # Budget on a 50Gi root fs:
+    #   image (unpacked)      ~17 GB
+    #   Forge copy + runtime   ~3 GB
+    #   entrypoint + logs      ~1 GB
+    #   ---------------------------------
+    #   fixed cost              ~21 GB
+    #   leaves                  ~29 GB
+    #
+    # 20GB of models therefore leaves ~9GB of genuine headroom. The old 28GB
+    # default with no separate volume would have let the panel fill the disk and
+    # then Neo would die with an unrelated-looking write error.
     python3 "$PANEL_PY" \
         --models "$NEO_DIR/models.json" \
         --dest "$MODELS_DIR" \
+        --log-dir "$LOG_DIR" \
         --host 127.0.0.1 \
         --port "$PANEL_PORT" \
-        --quota-gb "${PANEL_QUOTA_GB:-28}" \
+        --quota-gb "${PANEL_QUOTA_GB:-20}" \
         > "$LOG_DIR/panel.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 1 15); do

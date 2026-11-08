@@ -38,6 +38,16 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+
+try:
+    import diag
+except ImportError as _diag_exc:  # pragma: no cover - defensive
+    # The diagnostics page is a nice-to-have; the download panel is the point
+    # of this process. If diag.py is missing (a stale image, a half-copied
+    # /work), degrade to a panel that reports diag as unavailable rather than
+    # refusing to start at all.
+    diag = None
+    _DIAG_ERROR = str(_diag_exc)
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -131,10 +141,15 @@ class Store:
     own Task, so the API never blocks on a 7 GB transfer.
     """
 
-    def __init__(self, models_path: Path, dest: Path, quota_gb: float) -> None:
+    def __init__(self, models_path: Path, dest: Path, quota_gb: float,
+                 log_dir: Path | None = None) -> None:
         self.models_path = models_path
         self.dest = dest
         self.quota_bytes = int(quota_gb * 1024**3)
+        # Where the entrypoint writes neo.log, panel.log, filebrowser.log, etc.
+        # Defaults to a sibling of the models dir, which is where the
+        # entrypoint puts it ($WORK/logs next to $WORK/models).
+        self.log_dir = log_dir or (dest.parent / "logs")
         self.lock = threading.Lock()
         self.tasks: dict[str, Task] = {}
         self.catalogue: dict[str, list[dict[str, Any]]] = {}
@@ -465,6 +480,28 @@ class QueueRequest(BaseModel):
     ids: list[str]
 
 
+@app.get("/api/diag")
+def api_diag() -> JSONResponse:
+    """System diagnostics: GPU, disk, memory, processes, log tails.
+
+    This is the answer to "the UI is up but something is wrong and I cannot
+    see what". Neo shows its own Gradio errors and this panel shows download
+    state, but neither shows whether the GPU is the one that was paid for,
+    whether the root filesystem is about to fill, or why the container last
+    restarted -- because that all goes to container stdout, which is only
+    reachable through the provider's CLI.
+
+    Nothing here is cached: every call re-reads /proc and re-tails the logs,
+    so a failing service shows up immediately.
+    """
+    if diag is None:
+        return JSONResponse(
+            {"error": "diag module unavailable", "detail": _DIAG_ERROR},
+            status_code=503,
+        )
+    return JSONResponse(diag.collect(Path(store.log_dir), store.dest))
+
+
 @app.get("/api/state")
 def api_state() -> JSONResponse:
     return JSONResponse(store.status())
@@ -563,6 +600,7 @@ PAGE = r"""<!doctype html>
   <div class="stat">Disk: <b id="used">–</b> used / <b id="quota">–</b> budget &nbsp;·&nbsp; <b id="free">–</b> free</div>
   <div class="grow"></div>
   <div class="stat" id="count"></div>
+  <a class="stat" href="__BASE__/diag" style="color:var(--acc);text-decoration:none;font-weight:500">System diagnostics →</a>
 </header>
 <div class="wrap">
   <div id="tasks"></div>
@@ -685,6 +723,174 @@ loadCats().then(loadModels);poll();setInterval(poll,2000);
 </script></body></html>"""
 
 
+DIAG_PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>System Diagnostics</title>
+<style>
+ :root{--bg:#12141a;--panel:#1b1e26;--line:#2b3040;--fg:#e6e8ee;--dim:#9aa1b2;
+       --acc:#5b8cff;--ok:#3fb950;--err:#f85149;--warn:#d29922}
+ *{box-sizing:border-box}
+ body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+ header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:20px;align-items:center;flex-wrap:wrap;background:var(--panel)}
+ h1{font-size:16px;margin:0;font-weight:600}
+ .grow{flex:1}
+ .wrap{padding:16px 20px;max-width:1600px;margin:0 auto}
+ h2{font-size:13px;color:var(--dim);font-weight:600;margin:24px 0 10px;text-transform:uppercase;letter-spacing:.05em}
+ .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:10px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
+ .kv{display:flex;justify-content:space-between;gap:12px;padding:3px 0;font-size:13px}
+ .kv span:first-child{color:var(--dim)}
+ .kv span:last-child{font-variant-numeric:tabular-nums;text-align:right}
+ .bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;margin:8px 0 4px}
+ .bar>i{display:block;height:100%;background:var(--acc)}
+ .bar.warn>i{background:var(--warn)} .bar.err>i{background:var(--err)}
+ .ok{color:var(--ok)} .err{color:var(--err)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+ pre{margin:0;padding:12px 14px;background:#0d0f14;border:1px solid var(--line);border-radius:6px;
+     font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;max-height:440px;white-space:pre-wrap;word-break:break-word}
+ details{margin-bottom:10px}
+ summary{cursor:pointer;padding:9px 12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;
+     font-size:13px;display:flex;justify-content:space-between;gap:12px}
+ summary::-webkit-details-marker{display:none}
+ details[open] summary{border-radius:6px 6px 0 0}
+ details[open] pre{border-radius:0 0 6px 6px;border-top:0}
+ table{width:100%;border-collapse:collapse;font-size:12.5px}
+ th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+ td{padding:5px 8px;border-bottom:1px solid rgba(43,48,64,.5)}
+ button{background:var(--acc);border:0;color:#fff;padding:7px 13px;border-radius:6px;cursor:pointer;font:inherit;font-weight:500}
+ .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+</style></head><body>
+<header>
+  <h1>System Diagnostics</h1>
+  <div class="dim" id="ts" style="font-size:12px"></div>
+  <div class="grow"></div>
+  <button id="refresh">Refresh</button>
+  <a class="dim" href="__BASE__/" style="text-decoration:none;font-size:12.5px">← Downloads</a>
+</header>
+<div class="wrap" id="root"><div class="dim">Loading…</div></div>
+
+<script>
+const B='__BASE__';
+const gb=v=>v==null?'–':(v/1e9).toFixed(2)+' GB';
+const el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
+const kv=(k,v,cls)=>{const d=el('div','kv');d.append(el('span',null,k));d.append(el('span',cls,v));return d;}
+const fmtAge=s=>s<60?s+'s ago':s<3600?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago';
+
+function diskCard(d){
+  const c=el('div','card');
+  c.append(el('div','mono',d.path));
+  const pct=d.percent_used||0;
+  const b=el('div','bar'+(pct>92?' err':pct>80?' warn':''));
+  const i=el('i');i.style.width=Math.min(100,pct)+'%';b.append(i);c.append(b);
+  c.append(kv('used',`${d.used_gb} / ${d.total_gb} GB`,pct>92?'err':pct>80?'warn':'ok'));
+  c.append(kv('free',d.free_gb+' GB',d.free_gb<3?'err':null));
+  return c;
+}
+
+function gpuCard(g){
+  const c=el('div','card');
+  if(!g.available){
+    c.append(el('div','err','GPU not available via torch'));
+    if(g.error)c.append(el('div','dim',g.error));
+    if(g.torch_version)c.append(kv('torch',g.torch_version));
+    if(g.torch_cuda_build)c.append(kv('cuda build',g.torch_cuda_build));
+    return c;
+  }
+  (g.devices||[]).forEach(d=>{
+    c.append(el('div','mono',d.name));
+    c.append(kv('VRAM total',d.total_vram_gb+' GB'));
+    c.append(kv('VRAM free',d.free_vram_gb+' GB',d.free_vram_gb<1?'warn':null));
+    c.append(kv('compute',d.compute_capability));
+    c.append(kv('SMs',d.multi_processor_count));
+  });
+  c.append(kv('torch',g.torch_version||'–'));
+  c.append(kv('cuda build',g.torch_cuda_build||'–'));
+  return c;
+}
+
+async function load(){
+  const r=await fetch(B+'/api/diag');
+  const d=await r.json();
+  const root=document.getElementById('root');root.innerHTML='';
+  document.getElementById('ts').textContent=new Date(d.timestamp*1000).toLocaleTimeString();
+
+  // GPU + disks up top: these are the two that actually break a deployment.
+  root.append(el('h2',null,'GPU'));
+  root.append(gpuCard(d.gpu));
+
+  root.append(el('h2',null,'Storage'));
+  const g=el('div','grid');
+  (d.system.disks||[]).forEach(x=>g.append(diskCard(x)));
+  root.append(g);
+
+  root.append(el('h2',null,'Memory & Load'));
+  const mc=el('div','card');
+  if(d.system.memory_gb){
+    const m=d.system.memory_gb;
+    mc.append(kv('RAM total',m.total+' GB'));
+    mc.append(kv('RAM available',m.available+' GB',m.available<1?'warn':null));
+  } else mc.append(el('div','dim','unavailable'));
+  if(d.system.loadavg)mc.append(kv('load avg',d.system.loadavg.map(x=>x.toFixed(2)).join(' / ')));
+  if(d.system.uptime_seconds!=null){
+    const s=d.system.uptime_seconds;
+    mc.append(kv('uptime',s<3600?Math.round(s/60)+'m':Math.round(s/3600)+'h '+Math.round(s%3600/60)+'m'));
+  }
+  root.append(mc);
+
+  root.append(el('h2',null,'Host'));
+  const hc=el('div','card');
+  Object.entries(d.system.host||{}).forEach(([k,v])=>hc.append(kv(k,v)));
+  root.append(hc);
+
+  root.append(el('h2',null,'Processes (by RSS)'));
+  const t=el('table');
+  const th=el('tr');['PID','name','RSS','CPU s'].forEach(x=>th.append(el('th',null,x)));
+  const thead=el('thead');thead.append(th);t.append(thead);
+  const tbody=el('tbody');
+  (d.processes||[]).forEach(p=>{
+    const tr=el('tr');
+    tr.append(el('td','mono',p.pid));
+    tr.append(el('td',null,p.name));
+    tr.append(el('td','mono',p.rss_mb+' MB'));
+    tr.append(el('td','mono',p.cpu_seconds));
+    tbody.append(tr);
+  });
+  t.append(tbody);
+  const tw=el('div','card');tw.append(t);root.append(tw);
+
+  root.append(el('h2',null,'Logs'));
+  const names=Object.keys(d.logs||{});
+  if(!names.length)root.append(el('div','card dim','no logs found'));
+  names.forEach(n=>{
+    const L=d.logs[n];
+    const det=el('details');
+    const sm=el('summary');
+    sm.append(el('span','mono',n));
+    sm.append(el('span','dim',`${(L.size/1024).toFixed(0)} KB · ${fmtAge(L.age_seconds)}`));
+    det.append(sm);
+    const pre=el('pre',null,L.lines.length?L.lines.join('\\n'):'(empty)');
+    det.append(pre);
+    root.append(det);
+  });
+}
+
+document.getElementById('refresh').onclick=load;
+load();setInterval(load,5000);
+</script></body></html>"""
+
+
+@app.get("/diag", response_class=HTMLResponse)
+def diag_page(request: Request) -> HTMLResponse:
+    """The browser view over /api/diag.
+
+    Deliberately dumb: fetch JSON, render it. All the collection logic lives
+    in diag.py so it can be tested without FastAPI.
+    """
+    base = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    return HTMLResponse(DIAG_PAGE.replace("__BASE__", base))
+
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     # The panel is published under /dl by Caddy, which strips the prefix before
@@ -714,11 +920,14 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=7861)
     ap.add_argument("--quota-gb", type=float, default=30.0,
                     help="Max bytes the models dir may occupy (0 = unlimited)")
+    ap.add_argument("--log-dir", default=os.path.expanduser("~/forge-neo/logs"),
+                    help="Directory the entrypoint writes service logs to")
     args = ap.parse_args()
 
     dest = Path(args.dest).expanduser()
     dest.mkdir(parents=True, exist_ok=True)
-    store = Store(Path(args.models).expanduser(), dest, args.quota_gb)
+    store = Store(Path(args.models).expanduser(), dest, args.quota_gb,
+                  Path(args.log_dir).expanduser())
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

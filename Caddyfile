@@ -83,6 +83,8 @@
 	}
 	handle /dl/* {
 		uri strip_prefix /dl
+		# Covers /dl/diag and /dl/api/diag too: stripping the prefix yields
+		# /diag and /api/diag, which is exactly what the panel serves.
 		reverse_proxy 127.0.0.1:7861 {
 			header_up X-Forwarded-Prefix /dl
 			flush_interval -1
